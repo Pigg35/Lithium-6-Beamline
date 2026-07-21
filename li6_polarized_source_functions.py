@@ -13,6 +13,7 @@ from scipy.spatial.distance import cdist
 amu = atomic_mass
 m_Li6 = 6.0151228874 * amu      # kg
 I_nuclear = 1
+hbar = h/(2*np.pi)
 
 # Approximate D-line wavelength scale used for beam/laser geometry estimates
 lambda_D = 670.977e-9           # m (representative Li D-line scale)
@@ -37,7 +38,7 @@ class SourceConfig:
     T_oven_C: float = 800.0
     oven_channel_radius: float = 0.02      # m, radius of the oven channel
     tube_length: float = 0.46803          # m
-    tube_radius: float = 6.373e-3          # m  (7 mm i.d.)
+    tube_radius: float = 6.373e-3          # m
     z_orifice: float = 0.80              # m downstream of tube exit
     orifice_radius: float = 2.5e-3       # m
     N_atoms: int = 5000000
@@ -428,14 +429,57 @@ def source_rate_effusive(cfg):
     T_K = cfg.T_oven_C + 273.15
     _, v_mean, _ = thermal_speeds(T_K, m_Li6)
     A = np.pi * cfg.oven_channel_radius**2  # Cross-sectional area of the oven channel before tube or capillaries
-    return 0.25 * cfg.n_exit_m3 * v_mean * A
+
+    # if there no oven flux estimate, use Antoine's law to estimate the vapor pressure and calculate the flux
+    if cfg.n_exit_m3 is not None:
+        return 0.25 * cfg.n_exit_m3 * v_mean * A
+    else:
+        # NIST Antoine-like fit (order-of-mag)
+        ANTOINE_A = 4.98831
+        ANTOINE_B = 7918.984
+        ANTOINE_C = -9.52
+
+        log10P_bar = ANTOINE_A - (ANTOINE_B / (T_K + ANTOINE_C))
+        vapor_pressure = (10**log10P_bar) * 1e5
+
+        n_vapor = vapor_pressure / (k_B * T_K)
+
+        return 0.25 * n_vapor * v_mean * A
 
 # Function for accepted flux through the orifice
-def accepted_flux(beam_orifice, cfg):
+def accepted_flux(beam_orifice, cfg, aperture_type="long_tube"):
     n_acc = np.count_nonzero(beam_orifice["accepted"])
     n_initial = cfg.N_atoms
     frac = n_acc / n_initial
-    return source_rate_effusive(cfg) * frac, frac
+
+    # Calculate the geometric acceptance (probability of an atom in the oven channel entering the tube or capillary array)
+    if aperture_type == "long_tube":
+        geometric_factor = (cfg.tube_radius / cfg.oven_channel_radius)**2
+    elif aperture_type == "multi_capillary":
+        geometric_factor = (cfg.array_radius / cfg.oven_channel_radius)**2
+    else:
+        raise ValueError("Unknown aperture_type. Must be 'long_tube' or 'multi_capillary'.")
+
+    return source_rate_effusive(cfg) * frac * geometric_factor, frac * geometric_factor
+
+# Function for calculating the flux exiting the oven
+def oven_output_flux(beam, cfg, aperture_type="long_tube"):
+    # Use transmission probability to estimate the flux exiting the oven
+    transmission_probability = beam.get("transmission_probability", 0.0)
+
+    # Applying geometric entrance factor
+    if aperture_type == "long_tube":
+        geometric_factor = (cfg.tube_radius / cfg.oven_channel_radius)**2
+        transmission_probability *= geometric_factor
+
+        return source_rate_effusive(cfg) * transmission_probability
+    elif aperture_type == "multi_capillary":
+        geometric_factor = (cfg.array_radius / cfg.oven_channel_radius)**2
+        transmission_probability *= geometric_factor
+
+        return source_rate_effusive(cfg) * transmission_probability
+    else:
+        raise ValueError("Unknown aperture_type. Must be 'long_tube' or 'multi_capillary'.")
 ######################################################################
 
 
@@ -472,13 +516,6 @@ def sample_effusive_beam(cfg, rng):
     N_accepted = np.sum(accepted)
     simulated_transmission = N_accepted / N_entered if N_entered > 0 else 0.0
     
-    # Total transparency of the nozzle grid face 
-    transparency = (cfg.tube_radius**2) / (cfg.oven_channel_radius**2)
-    
-    # If 'N_entered' atoms hit the nozzle face area, this is how many physically escape
-    # into the vacuum chamber beamline:
-    atoms_transmitting_into_beam = N_accepted * transparency
-
     # --- EXTRACT OUTGOING ATOMS ---
     theta_accepted = theta_reservoir[accepted]
     phi_accepted = phi[accepted]
@@ -507,8 +544,7 @@ def sample_effusive_beam(cfg, rng):
         "vx": vx, "vy": vy, "vz": vz,
         "p": p,
         # Metrics to answer your exact question:
-        "transmission_probability": simulated_transmission, 
-        "atoms_exited": atoms_transmitting_into_beam
+        "transmission_probability": simulated_transmission 
     }
 
 # Samples an effusive beam from the oven using a multi-capillary array exit
@@ -525,11 +561,13 @@ def rejection_sampling_multi_capillary(cfg, rng, print_metrics=True):
     # Generate Capillary Grid Positions
     capillary_positions = generate_capillary_positions(number_of_capillaries, capillary_outer_radius, array_radius, capillary_a, array_shape='hex')
 
-    # Calculating geometriical parameters and transparency fraction
+    # Calculating geometrical parameters and transparency fraction
     capillary_positions = np.array(capillary_positions)
     total_array_area = np.pi * (array_radius**2)
     total_open_area = number_of_capillaries * (np.pi * (capillary_a**2))
+
     transparency_fraction = total_open_area / total_array_area
+
     
     # if transparency_fraction > 1.0:
     #     raise ValueError("Geometry error: Total capillary area exceeds macroscopic array area!", transparency_fraction)
@@ -603,7 +641,7 @@ def rejection_sampling_multi_capillary(cfg, rng, print_metrics=True):
     return {
         "x": x0, "y": y0, "z": z0,
         "vx": v * nx, "vy": v * ny, "vz": v * nz,
-        "transmission_efficiency": transmission_efficiency,
+        "transmission_probability": transmission_efficiency,
         "p": p
     }
 ######################################################################
@@ -738,6 +776,7 @@ def apply_rf_block(beam, cfg):
 
 # Overall beam simulation function
 def run_simulation(cfg, rng, aperture_type='long_tube'):
+    # Collecting all beam dictionaries at each stage
     if aperture_type == 'long_tube':
         b0 = sample_effusive_beam(cfg, rng)
     elif aperture_type == 'multi_capillary':
@@ -750,8 +789,12 @@ def run_simulation(cfg, rng, aperture_type='long_tube'):
     b4 = apply_rf_block(b3, cfg)
     b5 = apply_orifice_acceptance(b4, cfg)
 
+    # Calculate the flux exiting the oven based on the transmission probability and geometric factors
+    oven_flux = oven_output_flux(b0, cfg, aperture_type=aperture_type)
+
+    # Calculate the accepted beam and flux metrics
     acc = accepted_beam(b5)
-    flux_acc, frac_acc = accepted_flux(b5, cfg)
+    flux_acc, frac_acc = accepted_flux(b5, cfg, aperture_type=aperture_type)
 
     pol_all = ensemble_polarization(b5)
     pol_acc = ensemble_polarization(acc) if len(acc["x"]) > 0 else {"Nm1":np.nan,"N0":np.nan,"Np1":np.nan,"Pz":np.nan,"Pzz":np.nan}
@@ -762,6 +805,7 @@ def run_simulation(cfg, rng, aperture_type='long_tube'):
         "beam0": b0, "beam1": b1, "beam2": b2, "beam3": b3, "beam4": b4, "beam5": b5,
         "accepted": acc,
         "flux_source": source_rate_effusive(cfg),
+        "oven_exit_flux": oven_flux,
         "flux_acc": flux_acc,
         "frac_acc": frac_acc,
         "pol_all": pol_all,
@@ -775,6 +819,7 @@ def summary_table(res):
     print("=== Beamline summary ===")
     print(f"Source flux estimate       : {res['flux_source']:.4e} atoms/s")
     print(f"Accepted fraction          : {res['frac_acc']:.4e}")
+    print(f"Oven exit flux              : {res['oven_exit_flux']:.4e} atoms/s")
     print(f"Accepted flux              : {res['flux_acc']:.4e} atoms/s")
     print()
     print("All atoms at orifice plane:")
@@ -859,6 +904,33 @@ def plot_beamline_maps(res, cfg):
     ax[1,2].set_xlabel("x [mm]")
     ax[1,2].set_ylabel("y [mm]")
     ax[1,2].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# Plots the beam profiles at different stages of the cooling process
+def plot_cooling_cross_sections(res):
+    b0, b1, b2 = res["beam0"], res["beam1"], res["beam2"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    # plotting source exit cross-section as 2D histogram
+    axes[0].hist2d(b0["x"]*1e3, b0["y"]*1e3, bins=80)
+    axes[0].set_title("Source Exit")
+    axes[0].set_xlabel("x [mm]")
+    axes[0].set_ylabel("y [mm]")
+
+    # plotting after transverse cooling cross-section as scatter plot
+    axes[1].scatter(b1["x"]*1e3, b1["y"]*1e3, s=2)
+    axes[1].set_title("Transverse Cooling Exit")
+    axes[1].set_xlabel("x [mm]")
+    axes[1].set_ylabel("y [mm]")
+
+    # plotting after 2D MOT cross-section as scatter plot
+    axes[2].scatter(b2["x"]*1e3, b2["y"]*1e3, s=2)
+    axes[2].set_title("2D MOT Exit")
+    axes[2].set_xlabel("x [mm]")
+    axes[2].set_ylabel("y [mm]")
 
     plt.tight_layout()
     plt.show()
