@@ -981,7 +981,7 @@ def simulation_for_optimizer(cfg, rng, aperture_type='long_tube', parameter_to_o
     b5 = apply_orifice_acceptance(b4, cfg)
 
     acc = accepted_beam(b5)
-    flux_acc, frac_acc = accepted_flux(b5, cfg)
+    flux_acc, frac_acc = accepted_flux(b5, cfg, aperture_type=aperture_type)
 
     pol_acc = ensemble_polarization(acc) if len(acc["x"]) > 0 else {"Nm1":np.nan,"N0":np.nan,"Np1":np.nan,"Pz":np.nan,"Pzz":np.nan}
 
