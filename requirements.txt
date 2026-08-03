@@ -4,3 +4,5 @@ scipy
 scikit-optimize
 jupyter
 ipykernel
+ipywidgets
+ipympl
