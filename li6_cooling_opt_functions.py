@@ -187,6 +187,27 @@ def sample_flux_weighted_speed(T_K, mass, N, rng):
     # returns ensemble of speeds
     return np.sqrt(y)
 
+# Function for accepted flux through the orifice
+def accepted_flux(beam_orifice, cfg, aperture_type="long_tube"):
+    n_acc = np.count_nonzero(beam_orifice["accepted"])
+    n_initial = cfg.N_atoms
+    frac = n_acc / n_initial
+
+    # Calculate the geometric acceptance (probability of an atom in the oven channel entering the tube or capillary array)
+    if aperture_type == "long_tube":
+        geometric_factor = (cfg.tube_radius / cfg.oven_channel_radius)**2
+    elif aperture_type == "multi_capillary":
+        geometric_factor = (cfg.array_radius / cfg.oven_channel_radius)**2
+    else:
+        raise ValueError("Unknown aperture_type. Must be 'long_tube' or 'multi_capillary'.")
+
+    # Calculate the effusive flux from the oven channel
+    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius)
+
+    # Returns accepted flux through the orifice (atoms/s out of oven * fraction of beam accepted over total entering tube * geometric factor for entering tube)
+    return oven_flux * frac * geometric_factor, frac * geometric_factor
+
+
 # Creates a new key in beam dictionary indicating particles that pass through the final orifice
 def apply_orifice_acceptance(beam, cfg):
     accepted = (beam["x"]**2 + beam["y"]**2) <= cfg.orifice_radius**2
@@ -508,11 +529,15 @@ def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True,
     frac_pass = b6["accepted"].mean()
     Ndot_orifice = len(beam['x']) * frac_pass
 
+    # Calculate the flux through the orifice
+    orifice_flux, _ = accepted_flux(b6, cfg, aperture_type="long_tube")
+
     return dict(
         frac_pass=frac_pass,
         Ndot_orifice=Ndot_orifice,
         traj=traj,
-        orifice_reference=orifice_reference
+        orifice_reference=orifice_reference,
+        orifice_flux=orifice_flux
     )
 ######################################################################
 
@@ -528,6 +553,7 @@ def optimize_2dmot_with_beam(
     beta_list=(0.0, 2e-24, 5e-24, 1e-23, 2e-23, 5e-23),
     kappa_list=(0.0, 2e-19, 5e-19, 1e-18, 2e-18, 5e-18),
     orifice_reference="mirror_end",
+    optimize_mode="Ndot_orifice"
 ):
     rows = []
     best = None
@@ -557,11 +583,18 @@ def optimize_2dmot_with_beam(
                     beta=beta,
                     kappa=kappa,
                     frac_pass=info["frac_pass"],
-                    Ndot_orifice=info["Ndot_orifice"]
+                    Ndot_orifice=info["Ndot_orifice"],
+                    orifice_flux=info["orifice_flux"]
                 )
+
                 rows.append(row)
-                if best is None or info["Ndot_orifice"] > best["Ndot_orifice"]:
-                    best = row.copy()
+                if optimize_mode == "Ndot_orifice":
+                    if best is None or info["Ndot_orifice"] > best["Ndot_orifice"]:
+                        best = row.copy()
+                elif optimize_mode == "orifice_flux":
+                    if best is None or info["orifice_flux"] > best["orifice_flux"]:
+                        best = row.copy()
+
     return pd.DataFrame(rows), best
 ######################################################################
 
