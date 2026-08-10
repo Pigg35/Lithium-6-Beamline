@@ -48,8 +48,8 @@ class SourceConfig:
     T_oven_C: float = 600.0
     T_oven_K: float = T_oven_C + 273.15
     oven_channel_radius: float = 0.02      # m, radius of the oven channel
-    tube_length: float = 0.46803           # m
-    tube_radius: float = 6.373e-3          # m
+    tube_length: float = 0.09453          # m
+    tube_radius: float = 1.808e-3          # m
 
     # MOT parameters
     beta_mot: float = 0.0       # damping coefficient for MOT (kg/s)
@@ -101,7 +101,7 @@ def lithium_vapor_pressure_Pa(T_K):
 def mean_speed_MB(T_K, m):
     return np.sqrt(8*kB*T_K/(np.pi*m))
 
-# Effusive flux through a hole, in atoms/s, given T, m, and hole diameter in mm
+# Effusive flux through a hole, in atoms/s, given T, m, and hole diameter
 ''' Note: Steffens et al. (1977) used a flux of 2e+14 atoms/s '''
 def effusive_flux_atoms_per_s(T_K, m, hole_d):
     P = lithium_vapor_pressure_Pa(T_K)
@@ -202,17 +202,41 @@ def accepted_flux(beam_orifice, cfg, aperture_type="long_tube"):
         raise ValueError("Unknown aperture_type. Must be 'long_tube' or 'multi_capillary'.")
 
     # Calculate the effusive flux from the oven channel
-    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius)
+    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)
 
     # Returns accepted flux through the orifice (atoms/s out of oven * fraction of beam accepted over total entering tube * geometric factor for entering tube)
     return oven_flux * frac * geometric_factor, frac * geometric_factor
-
 
 # Creates a new key in beam dictionary indicating particles that pass through the final orifice
 def apply_orifice_acceptance(beam, cfg):
     accepted = (beam["x"]**2 + beam["y"]**2) <= cfg.orifice_radius**2
     beam["accepted"] = accepted
     return beam
+
+# Function for calculating oven source consumption rate
+def oven_consumption_rate(beam, cfg, recycling_efficiency=1.0):
+    # Calculate the flux inside the oven channel
+    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)  # Convert radius to diameter
+
+    # Calculate the flux of atoms entering the exit aperture
+    flux_entered = oven_flux * (cfg.tube_radius / cfg.oven_channel_radius)**2
+
+    # Calculate the consumption fraction, given recycling efficiency
+    frac_consumed = 1.0 - (1.0 - beam['transmission_probability']) * recycling_efficiency
+
+    # Calculate the consumption rate in atoms/s
+    consumption_rate = flux_entered * frac_consumed
+
+    # Convert to grams/s using the mass of lithium-6
+    consumption_rate_grams_per_s = consumption_rate * (cfg.mass * 1000.0) # Convert kg to grams
+
+    return dict(
+        consumption_rate_atoms_per_s=consumption_rate,
+        consumption_rate_grams_per_s=consumption_rate_grams_per_s,
+        consumption_rate_grams_per_hour=consumption_rate_grams_per_s * 3600.0,
+        consumption_rate_grams_per_day=consumption_rate_grams_per_s * 3600.0 * 24.0
+    )
+
 ######################################################################
 
 
