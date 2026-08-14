@@ -847,7 +847,7 @@ def plot_source_distributions(beam):
     # Plots longitudinal (z) speed
     ax[0].hist(beam["vz"], bins=80)
     ax[0].set_xlabel("$v_z$ [m/s]")
-    ax[0].set_ylabel("counts")
+    ax[0].set_ylabel("Counts")
     ax[0].set_title("Longitudinal speed")
 
     # Plots transverse speed

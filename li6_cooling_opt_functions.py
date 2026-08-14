@@ -1,5 +1,6 @@
 ######################################################################
 # Imports and configuration for the lithium beam source cooling optimization
+from matplotlib.pylab import beta
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -54,6 +55,8 @@ class SourceConfig:
     # MOT parameters
     beta_mot: float = 0.0       # damping coefficient for MOT (kg/s)
     kappa_mot: float = 0.0      # spring constant for MOT (N/m)
+    B_grad: float = 0.0        # T/m, magnetic field gradient for MOT
+    mu_eff: float = 9.274e-24   # J/T, effective magnetic moment for lithium-6 in the MOT
     length_mot: float = 0.05    # m, length of MOT region
 
     # Mirrors / laser parameters
@@ -158,6 +161,30 @@ def force_2d_molasses(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m
     
     return Fx, Fy, gtot
 
+# Function for calculating forces in the 2D MOT region using the quadrupole magnetic field and the two pairs of beams
+def force_2d_mot(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m, B_grad, mu_eff):
+    sx = s_local_gaussian(s0x_eff, w_m, x, y)
+    sy = s_local_gaussian(s0y_eff, w_m, x, y)
+
+    # Zeeman shift from 2D quadrupole field (opposite sign convention on x vs y)
+    zeeman_x = mu_eff * (B_grad * x) / hbar
+    zeeman_y = mu_eff * (B_grad * y) / hbar
+
+    dpx = delta - k*vx - zeeman_x
+    dmx = delta + k*vx + zeeman_x
+    dpy = delta - k*vy - zeeman_y
+    dmy = delta + k*vy + zeeman_y
+
+    gpx = gamma_sc(dpx, sx, Gamma)
+    gmx = gamma_sc(dmx, sx, Gamma)
+    gpy = gamma_sc(dpy, sy, Gamma)
+    gmy = gamma_sc(dmy, sy, Gamma)
+
+    Fx = hbar*k*(gpx - gmx)
+    Fy = hbar*k*(gpy - gmy)
+    gtot = gpx + gmx + gpy + gmy
+    return Fx, Fy, gtot
+
 # Simply a damped harmonic oscillator model, rather than the full Bloch-equation model for the MOT
 def apply_2d_mot_step(x, y, vx, vy, beta, kappa, m, dt):
     """Linear spring+damping toy model for the 2D MOT transverse force."""
@@ -234,7 +261,8 @@ def oven_consumption_rate(beam, cfg, recycling_efficiency=1.0):
         consumption_rate_atoms_per_s=consumption_rate,
         consumption_rate_grams_per_s=consumption_rate_grams_per_s,
         consumption_rate_grams_per_hour=consumption_rate_grams_per_s * 3600.0,
-        consumption_rate_grams_per_day=consumption_rate_grams_per_s * 3600.0 * 24.0
+        consumption_rate_grams_per_day=consumption_rate_grams_per_s * 3600.0 * 24.0,
+        consumption_rate_grams_per_year=consumption_rate_grams_per_s * 3600.0 * 24.0 * 365.25
     )
 
 ######################################################################
@@ -377,6 +405,25 @@ def propagate_beam(
             beam["vx"][active] = vx_new
             beam["vy"][active] = vy_new
 
+        # 2D MOT mode, using full Bloch-equation model with Zeeman shift from quadrupole field
+        elif mode == "mot_full":
+            Fx, Fy, gtot = force_2d_mot(
+                beam["x"][active], beam["y"][active], beam["vx"][active], beam["vy"][active],
+                cfg.delta_over_Gamma*cfg.Gamma, cfg.Gamma, cfg.k, hbar,
+                s0x_eff, s0y_eff, w_m,
+                cfg.B_grad, cfg.mu_eff
+            )
+
+            # Updates velocities using standard Euler integration
+            beam["vx"][active] += (Fx/cfg.mass)*dt_local
+            beam["vy"][active] += (Fy/cfg.mass)*dt_local
+
+            # Adds diffusion kicks from random photon emission
+            if cfg.include_diffusion:
+                sigma_v = np.sqrt(cfg.alpha_diff*(hbar*cfg.k)**2 * gtot * dt_local)/cfg.mass
+                beam["vx"][active] += rng.normal(0.0, sigma_v)
+                beam["vy"][active] += rng.normal(0.0, sigma_v)
+
         elif mode != "drift":
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -422,7 +469,10 @@ def propagate_beam(
     return beam, snapshots
 
 # Function for propagating the full system using the beam dictionary and source config
-def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True, record_traj=False, n_traj=200, n_record_region=6, orifice_reference="mirror_end"):
+def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True, 
+        record_traj=False, n_traj=200, n_record_region=6, 
+        mot_mode='mot', orifice_reference="mirror_end"
+        ):
     # Create a beam copy to avoid modifying the original
     beam = copy_beam(beam)
 
@@ -500,10 +550,10 @@ def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True,
         traj["x"].append(b3["x"][sel].copy())
 
     # propagate through MOT region
-    if use_mot and (cfg.beta_mot > 0 or cfg.kappa_mot > 0):
+    if use_mot:
         b4, snaps_mot = propagate_beam(
             b3, cfg, cfg.z_mot_end, cfg.dt,
-            mode="mot" if cfg.N_bounce_x > 0 and cfg.N_bounce_y > 0 else "drift",
+            mode=mot_mode if cfg.N_bounce_x > 0 and cfg.N_bounce_y > 0 else "drift",
             record_idx=sel,
             n_record=n_record_region,
             beta_mot=cfg.beta_mot,
@@ -578,7 +628,7 @@ def optimize_2dmot_with_beam(
     kappa_list=(0.0, 2e-19, 5e-19, 1e-18, 2e-18, 5e-18),
     orifice_reference="mirror_end",
     optimize_mode="Ndot_orifice"
-):
+    ):
     rows = []
     best = None
     for Lmot in L_mot_list_cm:
@@ -618,6 +668,54 @@ def optimize_2dmot_with_beam(
                 elif optimize_mode == "orifice_flux":
                     if best is None or info["orifice_flux"] > best["orifice_flux"]:
                         best = row.copy()
+
+    return pd.DataFrame(rows), best
+
+# Optimization function using Full MOT model
+def optimize_full_2dmot_with_beam(
+    beam, cfg,
+    L_mot_list_cm=(0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0),
+    B_grad_list=(0.00, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20),
+    orifice_reference="mirror_end",
+    optimize_mode="Ndot_orifice"
+    ):
+    rows = []
+    best = None
+    for Lmot in L_mot_list_cm:
+        for B_grad in B_grad_list:
+            # Create local copy of cfg to avoid modifying the original configuration
+            cfg_local = replace(cfg)
+
+            # Update the configuration for the current parameters
+            cfg_local.z_mot_end = cfg.z_mot_start + Lmot*1e-2
+            cfg_local.B_grad = float(B_grad)
+            cfg_local.use_mot = (Lmot > 0 and B_grad > 0)
+
+            # Propagate the system with the current configuration
+            info = propagate_system_with_beam(
+                beam=beam,
+                cfg=cfg_local,
+                record_traj=False,
+                n_traj=20,
+                mot_mode='mot_full',
+                orifice_reference=orifice_reference
+            )
+
+            row = dict(
+                L_mot_cm=Lmot,
+                B_grad=B_grad,
+                frac_pass=info["frac_pass"],
+                Ndot_orifice=info["Ndot_orifice"],
+                orifice_flux=info["orifice_flux"]
+            )
+
+            rows.append(row)
+            if optimize_mode == "Ndot_orifice":
+                if best is None or info["Ndot_orifice"] > best["Ndot_orifice"]:
+                    best = row.copy()
+            elif optimize_mode == "orifice_flux":
+                if best is None or info["orifice_flux"] > best["orifice_flux"]:
+                    best = row.copy()
 
     return pd.DataFrame(rows), best
 ######################################################################
@@ -663,5 +761,21 @@ def plot_sideview(case, cfg, title):
     plt.title(title)
     plt.grid(True)
     # plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.show()
+
+# Function for plotting oven consumption rate as a function of recycling efficiency
+def plot_consumptions(beam, cfg, recycling_efficiencies):
+    rates = []
+    for eff in recycling_efficiencies:
+        rate_info = oven_consumption_rate(beam, cfg, recycling_efficiency=eff)
+        rates.append(rate_info["consumption_rate_grams_per_day"])
+    
+    plt.figure()
+    plt.plot(recycling_efficiencies, rates, marker='o')
+    # plt.yscale('log')
+    plt.xlabel("Recycling Efficiency")
+    plt.ylabel("Oven Consumption Rate (grams/day)")
+    plt.title("Oven Consumption Rate vs Recycling Efficiency")
+    plt.grid(True)
     plt.show()
 ######################################################################
