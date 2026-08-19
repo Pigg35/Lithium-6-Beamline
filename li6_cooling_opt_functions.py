@@ -57,14 +57,16 @@ class SourceConfig:
     kappa_mot: float = 0.0      # spring constant for MOT (N/m)
     B_grad: float = 0.0        # T/m, magnetic field gradient for MOT
     mu_eff: float = 9.274e-24   # J/T, effective magnetic moment for lithium-6 in the MOT
-    length_mot: float = 0.05    # m, length of MOT region
+
+    Px_mW_mot: float = 80.0
+    Py_mW_mot: float = 80.0
+    w_mm_mot: float = 6.0
 
     # Mirrors / laser parameters
     N_bounce_x: int = 6          # number of bounces in x (horizontal) direction
     N_bounce_y: int = 6          # number of bounces in y (vertical) direction
     Rpass_x: float = 0.90        # reflectivity for p-polarized light
     Rpass_y: float = 0.90        # reflectivity for p-polarized light
-    length_mirror: float = 0.2   # m, length of mirror region
 
     Px_mW: float = 80.0
     Py_mW: float = 80.0
@@ -74,9 +76,9 @@ class SourceConfig:
 
     # Downstream geometry parameters (tube exit at z=0)
     z_cooling_start: float = 0.02                              # m, start of cooling region
-    z_cooling_end: float = z_cooling_start + length_mirror     # m, end of cooling region
-    z_mot_start: float = z_cooling_end + 0.01                  # m, start of MOT region
-    z_mot_end: float = z_mot_start + length_mot                # m, end of MOT region
+    z_cooling_end: float = 0.22                                # m, end of cooling region
+    z_mot_start: float = 0.221                 # m, start of MOT region
+    z_mot_end: float = 0.28                                    # m, end of MOT region
     z_orifice: float = 3.0                                     # m, position of the orifice plane
     orifice_radius: float = 5e-3                               # m (1 cm diameter)
 
@@ -85,8 +87,9 @@ class SourceConfig:
     skimmer_radius: float = 5e-3    # m (1 cm diameter)
 
     # Monte Carlo simulation parameters
-    dt: float = 2e-6
+    dt: float = 2e-7
     include_diffusion: bool = True
+    include_mot_diffusion: bool = True
     alpha_diff: float = 0.5
 ######################################################################
 
@@ -166,7 +169,7 @@ def force_2d_mot(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m, B_g
     sx = s_local_gaussian(s0x_eff, w_m, x, y)
     sy = s_local_gaussian(s0y_eff, w_m, x, y)
 
-    # Zeeman shift from 2D quadrupole field (opposite sign convention on x vs y)
+    # Zeeman shift from 2D quadrupole field
     zeeman_x = mu_eff * (B_grad * x) / hbar
     zeeman_y = mu_eff * (B_grad * y) / hbar
 
@@ -361,7 +364,7 @@ def propagate_beam(
         # Uses defined dt_step, unless atoms are in region for less than dt_step time, then uses that time
         dt_local = np.minimum(dt_step, (z_stop - beam["z"][active]) / beam["vz"][active])
 
-        # Calculating effective saturation parameters for the Gaussian beams in x and y directions
+        # Calculating effective saturation parameters for the Gaussian beams in x and y directions in mirror region
         w_m = cfg.w_mm*1e-3
         I0x = gaussian_I0(cfg.Px_mW*1e-3, w_m)
         I0y = gaussian_I0(cfg.Py_mW*1e-3, w_m)
@@ -373,6 +376,13 @@ def propagate_beam(
 
         s0x_eff = Gx*s0x
         s0y_eff = Gy*s0y
+
+        # Calculating effective saturation parameters for the beams in the 2D MOT region
+        w_m_mot = cfg.w_mm_mot*1e-3
+        I0x_mot = gaussian_I0(cfg.Px_mW_mot*1e-3, w_m)
+        I0y_mot = gaussian_I0(cfg.Py_mW_mot*1e-3, w_m)
+        s0x_eff_mot = I0x_mot/cfg.Isat
+        s0y_eff_mot = I0y_mot/cfg.Isat
 
         ### Selecting which propagation mode
         # Mirror mode, or 2D molasses
@@ -410,7 +420,7 @@ def propagate_beam(
             Fx, Fy, gtot = force_2d_mot(
                 beam["x"][active], beam["y"][active], beam["vx"][active], beam["vy"][active],
                 cfg.delta_over_Gamma*cfg.Gamma, cfg.Gamma, cfg.k, hbar,
-                s0x_eff, s0y_eff, w_m,
+                s0x_eff_mot, s0y_eff_mot, w_m_mot,
                 cfg.B_grad, cfg.mu_eff
             )
 
@@ -419,7 +429,7 @@ def propagate_beam(
             beam["vy"][active] += (Fy/cfg.mass)*dt_local
 
             # Adds diffusion kicks from random photon emission
-            if cfg.include_diffusion:
+            if cfg.include_mot_diffusion:
                 sigma_v = np.sqrt(cfg.alpha_diff*(hbar*cfg.k)**2 * gtot * dt_local)/cfg.mass
                 beam["vx"][active] += rng.normal(0.0, sigma_v)
                 beam["vy"][active] += rng.normal(0.0, sigma_v)
@@ -718,6 +728,28 @@ def optimize_full_2dmot_with_beam(
                     best = row.copy()
 
     return pd.DataFrame(rows), best
+
+# Objective function for Machine Learning optimizer using SciKit
+def objective(x, beam, cfg_base):
+    # Work on a copy so each skopt call evaluates an independent configuration
+    L_mot, B_grad, Px_mw, Py_mw, w_mm = x
+    cfg_local=replace(cfg_base)
+    cfg_local.z_mot_end = cfg_local.z_mot_start + L_mot*1e-2
+    cfg_local.B_grad = B_grad
+    cfg_local.Px_mW_mot = Px_mw
+    cfg_local.Py_mW_mot = Py_mw
+    cfg_local.w_mm_mot = w_mm
+
+    # Calculate metric for the optimizier
+    metric_dict = propagate_system_with_beam(beam, cfg_local, mot_mode='mot_full')
+
+    flux_metric = metric_dict['orifice_flux']
+
+    # Optional Punishments to add later
+
+    # Return negative flux to maximize
+    return -float(flux_metric)
+
 ######################################################################
 
 
