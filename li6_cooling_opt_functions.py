@@ -165,6 +165,7 @@ def force_2d_molasses(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m
     return Fx, Fy, gtot
 
 # Function for calculating forces in the 2D MOT region using the quadrupole magnetic field and the two pairs of beams
+''' Matches the force on atoms in MOT given by "Laser Cooling and Trapping" by Metcalf and van der Straten, 11.4a and 11.4b '''
 def force_2d_mot(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m, B_grad, mu_eff):
     sx = s_local_gaussian(s0x_eff, w_m, x, y)
     sy = s_local_gaussian(s0y_eff, w_m, x, y)
@@ -186,6 +187,7 @@ def force_2d_mot(x, y, vx, vy, delta, Gamma, k, hbar, s0x_eff, s0y_eff, w_m, B_g
     Fx = hbar*k*(gpx - gmx)
     Fy = hbar*k*(gpy - gmy)
     gtot = gpx + gmx + gpy + gmy
+
     return Fx, Fy, gtot
 
 # Simply a damped harmonic oscillator model, rather than the full Bloch-equation model for the MOT
