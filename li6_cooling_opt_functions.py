@@ -87,7 +87,7 @@ class SourceConfig:
     skimmer_radius: float = 5e-3    # m (1 cm diameter)
 
     # Monte Carlo simulation parameters
-    dt: float = 2e-7
+    dt: float = 2e-6
     include_diffusion: bool = True
     include_mot_diffusion: bool = True
     alpha_diff: float = 0.5
@@ -615,6 +615,14 @@ def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True,
     frac_pass = b6["accepted"].mean()
     Ndot_orifice = len(beam['x']) * frac_pass
 
+    # Calculate average transverse velocity of atoms exiting the MOT region (removing outliers above 95th percentile)
+    vt = np.sqrt(b4["vx"]**2 + b4["vy"]**2)
+    avg_vt_95 = np.percentile(vt, 95)
+
+    vt_outliers = vt > avg_vt_95
+    vt_filtered = vt[~vt_outliers]
+    avg_vt = np.mean(vt_filtered)
+
     # Calculate the flux through the orifice
     orifice_flux, _ = accepted_flux(b6, cfg, aperture_type="long_tube")
 
@@ -623,7 +631,8 @@ def propagate_system_with_beam(beam, cfg, use_mot = True, mirror_cooling = True,
         Ndot_orifice=Ndot_orifice,
         traj=traj,
         orifice_reference=orifice_reference,
-        orifice_flux=orifice_flux
+        orifice_flux=orifice_flux,
+        transverse_velocity=avg_vt
     )
 ######################################################################
 
@@ -760,7 +769,7 @@ def objective(x, beam, cfg_base):
 # Functions for plotting and visualizing the results of the lithium beam source cooling optimization
 
 # Generate 3 sideview plots for different configurations of the lithium beam source cooling optimization
-def plot_sideview(case, cfg, title):
+def plot_sideview(case, cfg, mot_length, title):
     traj = case["traj"]
     z_list = traj["z"]
     x_list = traj["x"]
@@ -776,24 +785,25 @@ def plot_sideview(case, cfg, title):
     z_start = 0.0
     z_cooling_start = cfg.z_cooling_start*1e2
     z_end = cfg.z_cooling_end*1e2
-    z_mot_end = cfg.z_mot_end*1e2
+    z_mot_end = (cfg.z_mot_start + mot_length*1e-2)*1e2
     z_or = cfg.z_orifice*1e2
     
-    plt.axvline(z_start, linestyle="--")
-    plt.axvline(z_cooling_start, linestyle="--", alpha=0.6)
-    plt.axvline(z_end, linestyle="--")
-    plt.axvline(z_mot_end, linestyle="--", alpha=0.6)
-    plt.axvline(z_or, linestyle="--", alpha=0.8)
+    # plt.axvline(z_start, linestyle="--")
+    plt.axvline(z_cooling_start, linestyle="--", color = 'blue', label="Mirror Start")
+    plt.axvline(z_end, linestyle="--", color = 'green', label="Mirror End/MOT Start")
+    plt.axvline(z_mot_end, linestyle="--", color ='red', label="MOT End")
+    plt.axvline(z_or, linestyle="--", label="Orifice Plane")
 
     # Orifice radius marker
     r_or = cfg.orifice_radius*1e3
-    plt.axhline(r_or, linestyle="--", color="black")
-    plt.axhline(-r_or, linestyle="--", color="black")
+    plt.axhline(r_or, xmin = 0.9, xmax = 1, linestyle="--", color="black", label="Orifice Radius")
+    plt.axhline(-r_or, xmin = 0.9, xmax = 1, linestyle="--", color="black")
     
     plt.xlabel("z (cm)")
     plt.ylabel("x (mm)")
     plt.title(title)
     plt.grid(True)
+    plt.legend()
     # plt.savefig(filename, dpi=300, bbox_inches="tight")
     plt.show()
 

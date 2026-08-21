@@ -779,7 +779,7 @@ def run_simulation(cfg, rng, aperture_type='long_tube'):
     if aperture_type == 'long_tube':
         b0 = sample_effusive_beam(cfg, rng)
     elif aperture_type == 'multi_capillary':
-        b0 = rejection_sampling_multi_capillary(cfg, rng)
+        b0 = rejection_sampling_multi_capillary(cfg, rng, print_metrics=False)
     else:
         raise ValueError(f"Unknown aperture_type: {aperture_type}")
     b1 = apply_transverse_cooling(b0, cfg)
@@ -908,7 +908,7 @@ def plot_beamline_maps(res, cfg):
     plt.show()
 
 # Plots the beam profiles at different stages of the cooling process
-def plot_cooling_cross_sections(res):
+def plot_cooling_cross_sections(res, title="Cooling Cross Sections"):
     b0, b1, b2 = res["beam0"], res["beam1"], res["beam2"]
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
@@ -930,6 +930,8 @@ def plot_cooling_cross_sections(res):
     axes[2].set_title("2D MOT Exit")
     axes[2].set_xlabel("x [mm]")
     axes[2].set_ylabel("y [mm]")
+
+    fig.suptitle(title, fontsize = 16)
 
     plt.tight_layout()
     plt.show()
