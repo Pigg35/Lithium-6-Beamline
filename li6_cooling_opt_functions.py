@@ -49,6 +49,7 @@ class SourceConfig:
     T_oven_C: float = 600.0
     T_oven_K: float = T_oven_C + 273.15
     oven_channel_radius: float = 0.02      # m, radius of the oven channel
+    include_geometric_factor: bool = True   # for oven designs with a channel connecting oven to exit
     tube_length: float = 0.09453          # m
     tube_radius: float = 1.808e-3          # m
 
@@ -106,6 +107,19 @@ def lithium_vapor_pressure_Pa(T_K):
 # Mean speed from Maxwell-Boltzmann distribution
 def mean_speed_MB(T_K, m):
     return np.sqrt(8*kB*T_K/(np.pi*m))
+
+# Samples directions from a cosine-weighted forward hemisphere (Lambertian distribution)
+def sample_lambert_directions(N, rng):
+    # cosine-weighted forward hemisphere
+    u1 = rng.random(N)
+    u2 = rng.random(N)
+    mu = np.sqrt(u1)             # mu = cos(theta)
+    sin_t = np.sqrt(1 - mu**2)
+    phi = 2*np.pi*u2 # uniform azimuth ( P(phi) = 1/2pi )
+    nx = sin_t*np.cos(phi)
+    ny = sin_t*np.sin(phi)
+    nz = mu
+    return nx, ny, nz
 
 # Effusive flux through a hole, in atoms/s, given T, m, and hole diameter
 ''' Note: Steffens et al. (1977) used a flux of 2e+14 atoms/s '''
@@ -234,10 +248,16 @@ def accepted_flux(beam_orifice, cfg, aperture_type="long_tube"):
         raise ValueError("Unknown aperture_type. Must be 'long_tube' or 'multi_capillary'.")
 
     # Calculate the effusive flux from the oven channel
-    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)
+    if cfg.include_geometric_factor:
+        oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)
 
-    # Returns accepted flux through the orifice (atoms/s out of oven * fraction of beam accepted over total entering tube * geometric factor for entering tube)
-    return oven_flux * frac * geometric_factor, frac * geometric_factor
+        # Returns accepted flux through the orifice (atoms/s out of oven * fraction of beam accepted over total entering tube * geometric factor for entering tube)
+        return oven_flux * frac * geometric_factor, frac * geometric_factor
+    else:
+        oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.tube_radius * 2.0)
+
+        # For oven designs without a connecting channel, tube directly on oven exit
+        return oven_flux * frac, frac
 
 # Creates a new key in beam dictionary indicating particles that pass through the final orifice
 def apply_orifice_acceptance(beam, cfg):
@@ -247,11 +267,16 @@ def apply_orifice_acceptance(beam, cfg):
 
 # Function for calculating oven source consumption rate
 def oven_consumption_rate(beam, cfg, recycling_efficiency=1.0):
-    # Calculate the flux inside the oven channel
-    oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)  # Convert radius to diameter
+    if cfg.include_geometric_factor:
+        # Calculate the flux inside the oven channel
+        oven_flux, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.oven_channel_radius * 2.0)  # Convert radius to diameter
 
-    # Calculate the flux of atoms entering the exit aperture
-    flux_entered = oven_flux * (cfg.tube_radius / cfg.oven_channel_radius)**2
+        # Calculate the flux of atoms entering the exit aperture
+        flux_entered = oven_flux * (cfg.tube_radius / cfg.oven_channel_radius)**2
+
+    else:
+        # For oven designs without a connecting channel, tube directly on oven exit
+        flux_entered, _, _, _, _ = effusive_flux_atoms_per_s(cfg.T_oven_K, cfg.mass, cfg.tube_radius * 2.0)
 
     # Calculate the consumption fraction, given recycling efficiency
     frac_consumed = 1.0 - (1.0 - beam['transmission_probability']) * recycling_efficiency
@@ -329,6 +354,198 @@ def sample_effusive_beam(cfg):
         "vx": vx, "vy": vy, "vz": vz,
         "transmission_probability": simulated_transmission 
     }
+
+# Samples an effusive beam from the tube exit, allowing atoms to diffusely re-emit off the wall instead of being lost
+def sample_effusive_beam_reemission(cfg, p_reheat, max_bounces=20, record_paths=0):
+    T_K = cfg.T_oven_C + 273.15
+    R = cfg.tube_radius
+    L = cfg.tube_length
+    N = int(cfg.N_atoms)
+
+    # INITIAL ENTRY: position on entrance disk, forward Lambertian direction
+    x, y = sample_disk(R, N, rng)
+    z = np.zeros(N)
+    ux, uy, uz = sample_lambert_directions(N, rng)
+    v = sample_flux_weighted_speed(T_K, cfg.mass, N, rng)
+    vx, vy, vz = v*ux, v*uy, v*uz
+
+    # All atoms start as alive and not yet transmitted
+    alive = np.ones(N, dtype=bool)          # still being ray-traced (has not exited or stuck)
+    transmitted = np.zeros(N, dtype=bool)   # reached z = L
+
+    # optionally snapshot the first n_trace atoms at every bounce, for trajectory plotting/debugging
+    n_trace = min(record_paths, N)
+    paths = [np.stack([x[:n_trace].copy(), y[:n_trace].copy(), z[:n_trace].copy()])] if n_trace > 0 else None
+
+    for _ in range(max_bounces):
+        # Extract indices of currently alive atoms, idx is an array
+        idx = np.where(alive)[0]
+        if idx.size == 0:
+            break
+
+        xi, yi, zi = x[idx], y[idx], z[idx]
+        speed = np.sqrt(vx[idx]**2 + vy[idx]**2 + vz[idx]**2)
+        dx, dy, dz = vx[idx]/speed, vy[idx]/speed, vz[idx]/speed
+
+        # NEXT SURFACE HIT: smallest positive path length to wall, exit plane, or entrance plane
+        a = dx**2 + dy**2
+        b = 2*(xi*dx + yi*dy)
+        c = xi**2 + yi**2 - R**2
+        disc = b**2 - 4*a*c
+        has_real = (a > 1e-30) & (disc >= 0)
+        sqrt_disc = np.sqrt(np.clip(disc, 0.0, None))
+        t1 = np.where(a > 1e-30, (-b - sqrt_disc)/np.where(a > 1e-30, 2*a, 1.0), np.inf)
+        t2 = np.where(a > 1e-30, (-b + sqrt_disc)/np.where(a > 1e-30, 2*a, 1.0), np.inf)
+        t_wall = np.where(has_real, np.minimum(np.where(t1 > 1e-9, t1, np.inf),
+                                                np.where(t2 > 1e-9, t2, np.inf)), np.inf)
+
+        t_exit = np.where(dz > 1e-15, (L - zi)/dz, np.inf)     # forward through z = L (transmitted)
+        t_back = np.where(dz < -1e-15, (0.0 - zi)/dz, np.inf)  # backward through z = 0 (lost to reservoir)
+
+        t_next = np.minimum(np.minimum(t_wall, t_exit), t_back)
+
+        x[idx] = xi + t_next*dx
+        y[idx] = yi + t_next*dy
+        z[idx] = zi + t_next*dz
+
+        is_exit = np.isfinite(t_exit) & (t_next == t_exit)
+        is_back = (~is_exit) & np.isfinite(t_back) & (t_next == t_back)
+        is_wall = (~is_exit) & (~is_back)
+
+        transmitted[idx[is_exit]] = True
+        alive[idx[is_exit]] = False
+        alive[idx[is_back]] = False
+
+        wall_idx = idx[is_wall]
+        if wall_idx.size > 0:
+            reheat_mask = rng.random(wall_idx.size) < p_reheat
+            alive[wall_idx[~reheat_mask]] = False   # sticking: atom is lost to the wall
+
+            re_idx = wall_idx[reheat_mask]
+            if re_idx.size > 0:
+                # local inward normal, plus two tangents (tube axis and azimuthal) forming an orthonormal basis
+                r_hit = np.sqrt(x[re_idx]**2 + y[re_idx]**2)
+                r_hit = np.where(r_hit < 1e-15, 1e-15, r_hit)
+                n_x, n_y = -x[re_idx]/r_hit, -y[re_idx]/r_hit
+                t1x, t1y, t1z = np.zeros_like(n_x), np.zeros_like(n_x), np.ones_like(n_x)
+                t2x, t2y = n_y, -n_x
+
+                s1, s2, s3 = sample_lambert_directions(re_idx.size, rng)  # s3 is cosine-weighted along local normal
+                new_ux = s3*n_x + s1*t1x + s2*t2x
+                new_uy = s3*n_y + s1*t1y + s2*t2y
+                new_uz = s3*0.0 + s1*t1z + s2*0.0
+
+                new_speed = sample_flux_weighted_speed(T_K, cfg.mass, re_idx.size, rng)
+                vx[re_idx] = new_speed*new_ux
+                vy[re_idx] = new_speed*new_uy
+                vz[re_idx] = new_speed*new_uz
+
+        if paths is not None:
+            paths.append(np.stack([x[:n_trace].copy(), y[:n_trace].copy(), z[:n_trace].copy()]))
+
+    n_truncated = int(np.sum(alive))  # still mid-transit when max_bounces ran out, not actually absorbed
+    if n_truncated > 0:
+        print(f"Warning: {n_truncated}/{N} atoms ({100*n_truncated/N:.2f}%) were still bouncing when "
+            f"max_bounces={max_bounces} ran out and were counted as lost; increase max_bounces if this is large.")
+    alive[:] = False  # any atoms exceeding max_bounces are treated as lost, not transmitted
+
+    N_accepted = int(np.sum(transmitted))
+    x0, y0 = x[transmitted], y[transmitted]
+    z0 = np.zeros(N_accepted)
+    vx_out, vy_out, vz_out = vx[transmitted], vy[transmitted], vz[transmitted]
+
+    result = {
+        "x": x0, "y": y0, "z": z0,
+        "vx": vx_out, "vy": vy_out, "vz": vz_out,
+        "transmission_probability": N_accepted / N if N > 0 else 0.0
+    }
+    if paths is not None:
+        result["traced_paths"] = np.array(paths)         # shape (n_steps, 3, n_trace)
+        result["traced_transmitted"] = transmitted[:n_trace]
+    return result
+
+# Plots r(z) trajectories from sample_effusive_beam_reemission(..., record_paths=n) to check wall bounces/re-emission
+def plot_tube_reemission_trajectories(beam, cfg, n_show=25, sub_samples=20):
+    paths = beam["traced_paths"]           # (n_steps, 3, n_trace): only sampled at bounce/exit events
+    transmitted = beam["traced_transmitted"]
+    n_show = min(n_show, paths.shape[2])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i in range(n_show):
+        xi, yi, zi = paths[:, 0, i], paths[:, 1, i], paths[:, 2, i]
+
+        # each bounce-to-bounce hop is a straight 3D line; r(z) dips in between, so interpolate before plotting
+        moved = (np.diff(xi) != 0) | (np.diff(yi) != 0) | (np.diff(zi) != 0)
+        last = np.where(moved)[0][-1] + 1 if np.any(moved) else 0
+
+        z_dense, r_dense = [], []
+        for k in range(last):
+            t = np.linspace(0.0, 1.0, sub_samples, endpoint=False)
+            x_seg = xi[k] + t*(xi[k+1] - xi[k])
+            y_seg = yi[k] + t*(yi[k+1] - yi[k])
+            z_seg = zi[k] + t*(zi[k+1] - zi[k])
+            z_dense.append(z_seg)
+            r_dense.append(np.sqrt(x_seg**2 + y_seg**2))
+        z_dense.append([zi[last]])
+        r_dense.append([np.sqrt(xi[last]**2 + yi[last]**2)])
+        z_dense = np.concatenate(z_dense)
+        r_dense = np.concatenate(r_dense)
+
+        color = 'tab:green' if transmitted[i] else 'tab:red'
+        ax.plot(z_dense*1e3, r_dense*1e3, lw=1, alpha=0.7, color=color)
+
+    ax.axhline(cfg.tube_radius*1e3, color='k', ls='--', lw=1, label='tube wall')
+    ax.axvline(0.0, color='gray', ls=':', lw=1, label='entrance')
+    ax.axvline(cfg.tube_length*1e3, color='gray', ls=':', lw=1, label='exit')
+    ax.set_xlabel("z [mm]")
+    ax.set_ylabel("r [mm]")
+    ax.set_title("Traced trajectories in tube (green = transmitted, red = lost)")
+    ax.legend()
+    fig.tight_layout()
+
+# Plots true 3D (x,y,z) trajectories from sample_effusive_beam_reemission(..., record_paths=n) inside the tube
+def plot_tube_reemission_trajectories_3d(beam, cfg, n_show=5, sub_samples=20):
+    paths = beam["traced_paths"]           # (n_steps, 3, n_trace): only sampled at bounce/exit events
+    transmitted = beam["traced_transmitted"]
+
+    # rank traced atoms by number of bounce segments so the busiest trajectories are shown by default
+    diffs = np.diff(paths, axis=0)
+    moved = np.any(diffs != 0, axis=1)     # (n_steps-1, n_trace)
+    n_segments = moved.sum(axis=0)
+    order = np.argsort(-n_segments)
+    show_idx = order[:min(n_show, paths.shape[2])]
+
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(projection='3d')
+
+    # wireframe of the cylindrical tube for reference
+    theta = np.linspace(0, 2*np.pi, 40)
+    z_wall = np.linspace(0, cfg.tube_length, 2)
+    theta_grid, z_grid = np.meshgrid(theta, z_wall)
+    ax.plot_wireframe(cfg.tube_radius*np.cos(theta_grid)*1e3, cfg.tube_radius*np.sin(theta_grid)*1e3,
+                       z_grid*1e3, color='gray', alpha=0.2, rstride=1, cstride=4)
+
+    for i in show_idx:
+        xi, yi, zi = paths[:, 0, i], paths[:, 1, i], paths[:, 2, i]
+        last = n_segments[i]
+
+        x_dense, y_dense, z_dense = [], [], []
+        for k in range(last):
+            t = np.linspace(0.0, 1.0, sub_samples, endpoint=False)
+            x_dense.append(xi[k] + t*(xi[k+1] - xi[k]))
+            y_dense.append(yi[k] + t*(yi[k+1] - yi[k]))
+            z_dense.append(zi[k] + t*(zi[k+1] - zi[k]))
+        x_dense.append([xi[last]]); y_dense.append([yi[last]]); z_dense.append([zi[last]])
+        x_dense, y_dense, z_dense = (np.concatenate(a) for a in (x_dense, y_dense, z_dense))
+
+        color = 'tab:green' if transmitted[i] else 'tab:red'
+        ax.plot(x_dense*1e3, y_dense*1e3, z_dense*1e3, lw=1, alpha=0.8, color=color)
+
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    ax.set_zlabel("z [mm]")
+    ax.set_title("3D traced trajectories in tube (green = transmitted, red = lost)")
+    fig.tight_layout()
 
 # Function for propagating beam through different regions using beam dictionary and source config
 def propagate_beam(

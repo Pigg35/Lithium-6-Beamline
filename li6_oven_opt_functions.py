@@ -546,6 +546,137 @@ def sample_effusive_beam(cfg, rng):
         "transmission_probability": simulated_transmission 
     }
 
+# Samples an effusive beam from the tube exit, allowing atoms to diffusely re-emit off the wall instead of being lost
+def sample_effusive_beam_reemission(cfg, rng, p_reheat, max_bounces=20, record_paths=0):
+    T_K = cfg.T_oven_C + 273.15
+    R = cfg.tube_radius
+    L = cfg.tube_length
+    N = int(cfg.N_atoms)
+
+    # INITIAL ENTRY: position on entrance disk, forward Lambertian direction
+    x, y = sample_disk(R, N, rng)
+    z = np.zeros(N)
+    ux, uy, uz = sample_lambert_directions(N, rng)
+    v = sample_flux_weighted_speed(T_K, m_Li6, N, rng)
+    vx, vy, vz = v*ux, v*uy, v*uz
+
+    alive = np.ones(N, dtype=bool)          # still being ray-traced (has not exited or stuck)
+    transmitted = np.zeros(N, dtype=bool)   # reached z = L
+
+    # optionally snapshot the first n_trace atoms at every bounce, for trajectory plotting/debugging
+    n_trace = min(record_paths, N)
+    paths = [np.stack([x[:n_trace].copy(), y[:n_trace].copy(), z[:n_trace].copy()])] if n_trace > 0 else None
+
+    for _ in range(max_bounces):
+        idx = np.where(alive)[0]
+        if idx.size == 0:
+            break
+
+        xi, yi, zi = x[idx], y[idx], z[idx]
+        speed = np.sqrt(vx[idx]**2 + vy[idx]**2 + vz[idx]**2)
+        dx, dy, dz = vx[idx]/speed, vy[idx]/speed, vz[idx]/speed
+
+        # NEXT SURFACE HIT: smallest positive path length to wall, exit plane, or entrance plane
+        a = dx**2 + dy**2
+        b = 2*(xi*dx + yi*dy)
+        c = xi**2 + yi**2 - R**2
+        disc = b**2 - 4*a*c
+        has_real = (a > 1e-30) & (disc >= 0)
+        sqrt_disc = np.sqrt(np.clip(disc, 0.0, None))
+        t1 = np.where(a > 1e-30, (-b - sqrt_disc)/np.where(a > 1e-30, 2*a, 1.0), np.inf)
+        t2 = np.where(a > 1e-30, (-b + sqrt_disc)/np.where(a > 1e-30, 2*a, 1.0), np.inf)
+        t_wall = np.where(has_real, np.minimum(np.where(t1 > 1e-9, t1, np.inf),
+                                                np.where(t2 > 1e-9, t2, np.inf)), np.inf)
+
+        t_exit = np.where(dz > 1e-15, (L - zi)/dz, np.inf)     # forward through z = L (transmitted)
+        t_back = np.where(dz < -1e-15, (0.0 - zi)/dz, np.inf)  # backward through z = 0 (lost to reservoir)
+
+        t_next = np.minimum(np.minimum(t_wall, t_exit), t_back)
+
+        x[idx] = xi + t_next*dx
+        y[idx] = yi + t_next*dy
+        z[idx] = zi + t_next*dz
+
+        is_exit = np.isfinite(t_exit) & (t_next == t_exit)
+        is_back = (~is_exit) & np.isfinite(t_back) & (t_next == t_back)
+        is_wall = (~is_exit) & (~is_back)
+
+        transmitted[idx[is_exit]] = True
+        alive[idx[is_exit]] = False
+        alive[idx[is_back]] = False
+
+        wall_idx = idx[is_wall]
+        if wall_idx.size > 0:
+            reheat_mask = rng.random(wall_idx.size) < p_reheat
+            alive[wall_idx[~reheat_mask]] = False   # sticking: atom is lost to the wall
+
+            re_idx = wall_idx[reheat_mask]
+            if re_idx.size > 0:
+                # local inward normal, plus two tangents (tube axis and azimuthal) forming an orthonormal basis
+                r_hit = np.sqrt(x[re_idx]**2 + y[re_idx]**2)
+                r_hit = np.where(r_hit < 1e-15, 1e-15, r_hit)
+                n_x, n_y = -x[re_idx]/r_hit, -y[re_idx]/r_hit
+                t1x, t1y, t1z = np.zeros_like(n_x), np.zeros_like(n_x), np.ones_like(n_x)
+                t2x, t2y = n_y, -n_x
+
+                s1, s2, s3 = sample_lambert_directions(re_idx.size, rng)  # s3 is cosine-weighted along local normal
+                new_ux = s3*n_x + s1*t1x + s2*t2x
+                new_uy = s3*n_y + s1*t1y + s2*t2y
+                new_uz = s3*0.0 + s1*t1z + s2*0.0
+
+                new_speed = sample_flux_weighted_speed(T_K, m_Li6, re_idx.size, rng)
+                vx[re_idx] = new_speed*new_ux
+                vy[re_idx] = new_speed*new_uy
+                vz[re_idx] = new_speed*new_uz
+
+        if paths is not None:
+            paths.append(np.stack([x[:n_trace].copy(), y[:n_trace].copy(), z[:n_trace].copy()]))
+
+    alive[:] = False  # any atoms exceeding max_bounces are treated as lost, not transmitted
+
+    N_accepted = int(np.sum(transmitted))
+    x0, y0 = x[transmitted], y[transmitted]
+    z0 = np.zeros(N_accepted)
+    vx_out, vy_out, vz_out = vx[transmitted], vy[transmitted], vz[transmitted]
+
+    STATE_LABELS = state_labels()
+    N_STATES = len(STATE_LABELS)
+    p = np.full((N_accepted, N_STATES), 1.0/N_STATES)
+
+    result = {
+        "x": x0, "y": y0, "z": z0,
+        "vx": vx_out, "vy": vy_out, "vz": vz_out,
+        "p": p,
+        "transmission_probability": N_accepted / N if N > 0 else 0.0
+    }
+    if paths is not None:
+        result["traced_paths"] = np.array(paths)         # shape (n_steps, 3, n_trace)
+        result["traced_transmitted"] = transmitted[:n_trace]
+    return result
+
+# Plots r(z) trajectories from sample_effusive_beam_reemission(..., record_paths=n) to check wall bounces/re-emission
+def plot_tube_reemission_trajectories(beam, cfg, n_show=25):
+    paths = beam["traced_paths"]           # (n_steps, 3, n_trace)
+    transmitted = beam["traced_transmitted"]
+    n_show = min(n_show, paths.shape[2])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i in range(n_show):
+        xi, yi, zi = paths[:, 0, i], paths[:, 1, i], paths[:, 2, i]
+        r = np.sqrt(xi**2 + yi**2)
+        color = 'tab:green' if transmitted[i] else 'tab:red'
+        ax.plot(zi*1e3, r*1e3, marker='o', markersize=2, lw=1, alpha=0.7, color=color)
+
+    ax.axhline(cfg.tube_radius*1e3, color='k', ls='--', lw=1, label='tube wall')
+    ax.axvline(0.0, color='gray', ls=':', lw=1, label='entrance')
+    ax.axvline(cfg.tube_length*1e3, color='gray', ls=':', lw=1, label='exit')
+    ax.set_xlabel("z [mm]")
+    ax.set_ylabel("r [mm]")
+    ax.set_title("Traced trajectories in tube (green = transmitted, red = lost)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
 # Samples an effusive beam from the oven using a multi-capillary array exit
 def rejection_sampling_multi_capillary(cfg, rng, print_metrics=True):
     T_K = cfg.T_oven_C + 273.15
